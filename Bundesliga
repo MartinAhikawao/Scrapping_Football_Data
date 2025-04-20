@@ -1,0 +1,654 @@
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import time
+import logging
+import csv
+import os
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Set up Chrome options
+chrome_options = Options()
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--headless")  # Run in background
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+chrome_options.add_argument("--remote-allow-origins=")  # allow origins for ChromeDriver
+chrome_options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+# Function to save match data to CSV
+def save_to_csv(match_data, file_path="bundesliga_match_data.csv"):
+    fieldnames = [
+        'Home_Team', 'Away_Team', 'Home_Score', 'Away_Score',
+        'Home_Possession', 'Home_Total_Shots', 'Home_Shots_On_Target', 'Home_Corner_Kicks',
+        'Away_Possession', 'Away_Total_Shots', 'Away_Shots_On_Target', 'Away_Corner_Kicks',
+        'Home_Odds', 'Draw_Odds', 'Away_Odds', 'Bookmaker',
+        'Home_Recent_Wins', 'Home_Recent_Draws', 'Home_Recent_Losses',
+        'Home_Recent_Goals_Scored', 'Home_Recent_Goals_Conceded',
+        'Away_Recent_Wins', 'Away_Recent_Draws', 'Away_Recent_Losses',
+        'Away_Recent_Goals_Scored', 'Away_Recent_Goals_Conceded',
+        'H2H_Home_Wins', 'H2H_Away_Wins', 'H2H_Draws',
+        'Match_Date'
+    ]
+    # Ensure all fields exist in the dictionary
+    for field in fieldnames:
+        if field not in match_data:
+            match_data[field] = 'N/A'
+    file_exists = os.path.isfile(file_path)
+    with open(file_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(match_data)
+    logger.info(f"Match data saved to {file_path}")
+
+# Function to check if two team names likely refer to the same team
+def team_names_match(name1, name2):
+    # Convert to lowercase for case-insensitive comparison
+    name1 = name1.lower()
+    name2 = name2.lower()
+    
+    # Check for exact match
+    if name1 == name2:
+        return True
+    
+    # Check if one is a substring of the other
+    if name1 in name2 or name2 in name1:
+        return True
+    
+    # Check for common abbreviations/variations (Bundesliga teams)
+    common_abbrevs = {
+        'bayern': ['bayern munich', 'bayern münchen', 'fc bayern', 'fc bayern munich', 'fc bayern münchen'],
+        'dortmund': ['borussia dortmund', 'bvb', 'borussia dortmund 09'],
+        'leverkusen': ['bayer leverkusen', 'bayer 04 leverkusen'],
+        'leipzig': ['rb leipzig', 'rasenballsport leipzig'],
+        'gladbach': ['borussia mönchengladbach', 'borussia monchengladbach', 'borussia m.gladbach'],
+        'wolfsburg': ['vfl wolfsburg'],
+        'frankfurt': ['eintracht frankfurt'],
+        'hoffenheim': ['tsg hoffenheim', '1899 hoffenheim', 'tsg 1899 hoffenheim'],
+        'hertha': ['hertha berlin', 'hertha bsc'],
+        'schalke': ['schalke 04', 'fc schalke 04'],
+        'mainz': ['mainz 05', 'fsv mainz 05', '1. fsv mainz 05'],
+        'freiburg': ['sc freiburg'],
+        'augsburg': ['fc augsburg'],
+        'stuttgart': ['vfb stuttgart'],
+        'hannover': ['hannover 96'],
+        'bremen': ['werder bremen', 'sv werder bremen'],
+        'köln': ['fc köln', 'fc koln', '1. fc köln', '1. fc koln'],
+        'hamburger': ['hamburger sv', 'hsv'],
+        'paderborn': ['sc paderborn', 'sc paderborn 07'],
+        'düsseldorf': ['fortuna düsseldorf', 'fortuna dusseldorf'],
+        'union berlin': ['1. fc union berlin'],
+        'bielefeld': ['arminia bielefeld', 'dsv arminia bielefeld'],
+        'bochum': ['vfl bochum'],
+        'greuther furth': ['greuther fürth', 'spvgg greuther fürth', 'spvgg greuther furth'],
+        'heidenheim': ['1. fc heidenheim'],
+        'kiel': ['holstein kiel'],
+        'darmstadt': ['sv darmstadt 98'],
+        'st. pauli': ['fc st. pauli'],
+        'magdeburg': ['1. fc magdeburg'],
+        'kaiserslautern': ['1. fc kaiserslautern'],
+        'nurnberg': ['nürnberg', '1. fc nürnberg', '1. fc nurnberg'],
+    }
+    
+    # Check if either name matches a known abbreviation
+    for abbrev, variations in common_abbrevs.items():
+        if name1 == abbrev or name1 in variations:
+            if name2 == abbrev or name2 in variations:
+                return True
+    
+    return False
+
+# Function to extract data from a match page including H2H stats
+def extract_match_data(driver):
+    # Initialize match data dictionary with default values
+    match_data = {
+        'Home_Team': 'Unknown Home Team',
+        'Away_Team': 'Unknown Away Team',
+        'Home_Score': 'N/A',
+        'Away_Score': 'N/A',
+        'Home_Possession': 'N/A',
+        'Home_Total_Shots': 'N/A',
+        'Home_Shots_On_Target': 'N/A',
+        'Home_Corner_Kicks': 'N/A',
+        'Away_Possession': 'N/A',
+        'Away_Total_Shots': 'N/A',
+        'Away_Shots_On_Target': 'N/A',
+        'Away_Corner_Kicks': 'N/A',
+        'Home_Odds': 'N/A',
+        'Draw_Odds': 'N/A',
+        'Away_Odds': 'N/A',
+        'Bookmaker': 'N/A',
+        'Home_Recent_Wins': 0,
+        'Home_Recent_Draws': 0,
+        'Home_Recent_Losses': 0,
+        'Home_Recent_Goals_Scored': 0,
+        'Home_Recent_Goals_Conceded': 0,
+        'Away_Recent_Wins': 0,
+        'Away_Recent_Draws': 0,
+        'Away_Recent_Losses': 0,
+        'Away_Recent_Goals_Scored': 0,
+        'Away_Recent_Goals_Conceded': 0,
+        'H2H_Home_Wins': 0,
+        'H2H_Away_Wins': 0,
+        'H2H_Draws': 0,
+        'Match_Date': datetime.now().strftime("%Y-%m-%d")
+    }
+
+    # -------------------
+    # TEAM NAME EXTRACTION
+    # -------------------
+    try:
+        # Method 1: Using participant names on the match detail page
+        home_team_element = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".participant__participantName"))
+        )
+        away_team_element = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".participant__participantName.participant__away"))
+        )
+        match_data['Home_Team'] = home_team_element.text.strip()
+        match_data['Away_Team'] = away_team_element.text.strip()
+        logger.info(f"Extracted team names from match page: {match_data['Home_Team']} vs {match_data['Away_Team']}")
+    except Exception as e:
+        logger.info(f"Method 1 for team extraction failed: {e}")
+        try:
+            # Method 2: Using scoreboard teams
+            teams_container = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".duelParticipant"))
+            )
+            home_team_element = teams_container.find_element(By.CSS_SELECTOR, ".duelParticipant__home .participant__participantName")
+            away_team_element = teams_container.find_element(By.CSS_SELECTOR, ".duelParticipant__away .participant__participantName")
+            match_data['Home_Team'] = home_team_element.text.strip()
+            match_data['Away_Team'] = away_team_element.text.strip()
+            logger.info(f"Extracted team names using scoreboard: {match_data['Home_Team']} vs {match_data['Away_Team']}")
+        except Exception as e:
+            logger.info(f"Method 2 for team extraction failed: {e}")
+            try:
+                # Method 3: Using page title
+                title = driver.title
+                if " - " in title:
+                    teams_section = title.split(" - ")[0].strip()
+                    if " vs " in teams_section:
+                        teams = teams_section.split(" vs ")
+                        match_data['Home_Team'] = teams[0].strip()
+                        match_data['Away_Team'] = teams[1].strip()
+                        logger.info(f"Extracted team names from page title: {match_data['Home_Team']} vs {match_data['Away_Team']}")
+            except Exception as e:
+                logger.error(f"All methods for team extraction failed: {e}")
+
+    # -------------------
+    # SCORE EXTRACTION
+    # -------------------
+    html = driver.page_source
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    score_wrapper = soup.select_one(".detailScore__wrapper")
+    if not score_wrapper:
+        logger.info("Trying alternative selectors for score...")
+        score_wrapper = soup.select_one("[class*='detailScore']")
+    
+    if score_wrapper:
+        spans = score_wrapper.find_all("span")
+        if len(spans) >= 3:
+            match_data['Home_Score'] = spans[0].text.strip()
+            match_data['Away_Score'] = spans[2].text.strip()
+            logger.info(f"Extracted score: {match_data['Home_Score']}-{match_data['Away_Score']}")
+        else:
+            score_text = score_wrapper.get_text().strip()
+            if "-" in score_text:
+                scores = score_text.split('-')
+                if len(scores) >= 2:
+                    match_data['Home_Score'] = scores[0].strip()
+                    match_data['Away_Score'] = scores[1].strip()
+                    logger.info(f"Extracted score from text: {score_text}")
+            else:
+                logger.error("Could not extract score from spans or text")
+    else:
+        logger.error("Score wrapper not found")
+        driver.save_screenshot("error_screenshot.png")
+        with open("page_source.html", "w", encoding="utf-8") as f:
+            f.write(html)
+
+    # -------------------
+    # STATS EXTRACTION
+    # -------------------
+    try:
+        try:
+            stats_tab = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='wcl-tab' and contains(text(), 'Stats')]"))
+            )
+        except:
+            try:
+                stats_tab = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button.wcl-tab_y-fEC"))
+                )
+            except:
+                stats_tab = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-analytics-tab-name='match-statistics']"))
+                )
+        driver.execute_script("arguments[0].scrollIntoView(true);", stats_tab)
+        driver.execute_script("arguments[0].click();", stats_tab)
+        logger.info("Clicked on STATS tab")
+        time.sleep(3)
+        
+        html = driver.page_source
+        soup = BeautifulSoup(html, 'html.parser')
+        stat_rows = soup.select(".wcl-row_OFViZ[data-testid='wcl-statistics']")
+        logger.info(f"Found {len(stat_rows)} stat rows")
+        for row in stat_rows:
+            try:
+                category = row.select_one(".wcl-category_7qsgP").get_text().strip().lower()
+                home_value = row.select_one(".wcl-value_IuyQw.wcl-homeValue_-iJBW").get_text().strip()
+                away_value = row.select_one(".wcl-value_IuyQw.wcl-awayValue_rQvxs").get_text().strip()
+                logger.info(f"Stat: {category} - Home: {home_value}, Away: {away_value}")
+                if "ball possession" in category:
+                    match_data['Home_Possession'] = home_value
+                    match_data['Away_Possession'] = away_value
+                elif "total shots" in category:
+                    match_data['Home_Total_Shots'] = home_value
+                    match_data['Away_Total_Shots'] = away_value
+                elif "shots on target" in category:
+                    match_data['Home_Shots_On_Target'] = home_value
+                    match_data['Away_Shots_On_Target'] = away_value
+                elif "corner kicks" in category:
+                    match_data['Home_Corner_Kicks'] = home_value
+                    match_data['Away_Corner_Kicks'] = away_value
+            except Exception as e:
+                logger.warning(f"Error processing a stat row: {e}")
+    except Exception as e:
+        logger.error(f"Error navigating/extracting STATS: {e}")
+        driver.save_screenshot("stats_error_screenshot.png")
+
+    # -------------------
+    # ODDS EXTRACTION
+    # -------------------
+    try:
+        try:
+            odds_tab = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='wcl-tab' and contains(text(), 'Odds')]"))
+            )
+        except:
+            try:
+                odds_tab = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-analytics-tab-name='odds-comparison'] button"))
+                )
+            except:
+                odds_tab = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[href*='odds-comparison']"))
+                )
+        driver.execute_script("arguments[0].scrollIntoView(true);", odds_tab)
+        driver.execute_script("arguments[0].click();", odds_tab)
+        logger.info("Clicked on ODDS tab")
+        time.sleep(3)
+        
+        html = driver.page_source
+        soup = BeautifulSoup(html, 'html.parser')
+        odds_rows = soup.select("div.ui-table__row")
+        logger.info(f"Found {len(odds_rows)} odds rows")
+        if odds_rows:
+            first_row = odds_rows[0]
+            try:
+                bookmaker_img = first_row.select_one("img.prematchLogo")
+                if bookmaker_img:
+                    if bookmaker_img.has_attr('title'):
+                        match_data['Bookmaker'] = bookmaker_img['title'].strip()
+                    elif bookmaker_img.has_attr('alt'):
+                        match_data['Bookmaker'] = bookmaker_img['alt'].strip()
+            except Exception as e:
+                logger.warning(f"Could not extract bookmaker name: {e}")
+            odds_cells = first_row.select("a.oddsCell__odd span")
+            if len(odds_cells) >= 3:
+                match_data['Home_Odds'] = odds_cells[0].text.strip()
+                match_data['Draw_Odds'] = odds_cells[1].text.strip()
+                match_data['Away_Odds'] = odds_cells[2].text.strip()
+                logger.info(f"Extracted odds: Home {match_data['Home_Odds']}, Draw {match_data['Draw_Odds']}, Away {match_data['Away_Odds']}")
+            else:
+                logger.warning("Not enough odds cells found")
+        else:
+            logger.warning("No odds rows found")
+    except Exception as e:
+        logger.error(f"Error extracting ODDS: {e}")
+        driver.save_screenshot("odds_error_screenshot.png")
+
+    # -------------------
+    # H2H EXTRACTION
+    # -------------------
+    try:
+        # Try multiple selectors for H2H tab
+        h2h_selectors = [
+            "//button[@data-testid='wcl-tab' and contains(text(), 'H2H')]",
+            "a[data-analytics-tab-name='h2h'] button",
+            "a[href*='h2h']",
+            "//button[contains(text(), 'H2H')]",
+            "//div[contains(@class, 'tabs')]//*[contains(text(), 'H2H')]"
+        ]
+        
+        h2h_tab = None
+        for selector in h2h_selectors:
+            try:
+                if selector.startswith("//"):
+                    h2h_tab = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                else:
+                    h2h_tab = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                break
+            except:
+                continue
+        
+        if h2h_tab:
+            driver.execute_script("arguments[0].scrollIntoView(true);", h2h_tab)
+            driver.execute_script("arguments[0].click();", h2h_tab)
+            logger.info("Clicked on H2H tab")
+            time.sleep(3)
+            
+            h2h_html = driver.page_source
+            h2h_soup = BeautifulSoup(h2h_html, 'html.parser')
+            
+            # Assume the H2H content is divided into three sections (by order)
+            rows_sections = h2h_soup.select("div.rows")
+            if len(rows_sections) >= 3:
+                home_recent_section = rows_sections[0]
+                away_recent_section = rows_sections[1]
+                h2h_matches_section = rows_sections[2]
+            else:
+                logger.warning("H2H sections not as expected")
+                home_recent_section = away_recent_section = h2h_matches_section = None
+
+            # --- Process home team's recent matches ---
+            home_recent_wins = home_recent_draws = home_recent_losses = 0
+            home_recent_goals_scored = home_recent_goals_conceded = 0
+            if home_recent_section:
+                rows = home_recent_section.select("div.h2h__row")
+                for row in rows:
+                    score_spans = row.select("span.h2h__result span")
+                    if len(score_spans) >= 2:
+                        try:
+                            score1 = int(score_spans[0].text.strip())
+                            score2 = int(score_spans[1].text.strip())
+                        except:
+                            continue
+                        highlighted = row.select_one("span.h2h__participant.highlighted")
+                        if highlighted:
+                            classes = highlighted.get("class")
+                            if "h2h__homeParticipant" in classes:
+                                team_score = score1
+                                opp_score = score2
+                            elif "h2h__awayParticipant" in classes:
+                                team_score = score2
+                                opp_score = score1
+                            else:
+                                continue
+                            home_recent_goals_scored += team_score
+                            home_recent_goals_conceded += opp_score
+                            if team_score > opp_score:
+                                home_recent_wins += 1
+                            elif team_score == opp_score:
+                                home_recent_draws += 1
+                            else:
+                                home_recent_losses += 1
+                logger.info(f"Home recent: Wins {home_recent_wins}, Draws {home_recent_draws}, Losses {home_recent_losses}, Goals Scored {home_recent_goals_scored}, Goals Conceded {home_recent_goals_conceded}")
+            else:
+                logger.warning("Home recent section not found in H2H")
+                
+            # --- Process away team's recent matches ---
+            away_recent_wins = away_recent_draws = away_recent_losses = 0
+            away_recent_goals_scored = away_recent_goals_conceded = 0
+            if away_recent_section:
+                rows = away_recent_section.select("div.h2h__row")
+                for row in rows:
+                    score_spans = row.select("span.h2h__result span")
+                    if len(score_spans) >= 2:
+                        try:
+                            score1 = int(score_spans[0].text.strip())
+                            score2 = int(score_spans[1].text.strip())
+                        except:
+                            continue
+                        highlighted = row.select_one("span.h2h__participant.highlighted")
+                        if highlighted:
+                            classes = highlighted.get("class")
+                            if "h2h__homeParticipant" in classes:
+                                team_score = score1
+                                opp_score = score2
+                            elif "h2h__awayParticipant" in classes:
+                                team_score = score2
+                                opp_score = score1
+                            else:
+                                continue
+                            away_recent_goals_scored += team_score
+                            away_recent_goals_conceded += opp_score
+                            if team_score > opp_score:
+                                away_recent_wins += 1
+                            elif team_score == opp_score:
+                                away_recent_draws += 1
+                            else:
+                                away_recent_losses += 1
+                logger.info(f"Away recent: Wins {away_recent_wins}, Draws {away_recent_draws}, Losses {away_recent_losses}, Goals Scored {away_recent_goals_scored}, Goals Conceded {away_recent_goals_conceded}")
+            else:
+                logger.warning("Away recent section not found in H2H")
+            
+            # --- Process head-to-head matches between the two teams ---
+            h2h_home_wins = h2h_away_wins = h2h_draws = 0
+            if h2h_matches_section:
+                rows = h2h_matches_section.select("div.h2h__row")
+                # Get the current match teams
+                current_home_team = match_data['Home_Team']
+                current_away_team = match_data['Away_Team']
+                logger.info(f"Current match teams: {current_home_team} vs {current_away_team}")
+                
+                for row in rows:
+                    try:
+                        # Extract teams and scores from this H2H match
+                        home_participant = row.select_one(".h2h__participant.h2h__homeParticipant .h2h__participantInner")
+                        away_participant = row.select_one(".h2h__participant.h2h__awayParticipant .h2h__participantInner")
+                        
+                        if not home_participant or not away_participant:
+                            logger.warning("Could not find team elements in H2H row")
+                            continue
+                        
+                        h2h_home_team = home_participant.text.strip()
+                        h2h_away_team = away_participant.text.strip()
+                        
+                        score_spans = row.select("span.h2h__result span")
+                        if len(score_spans) < 2:
+                            continue
+                            
+                        try:
+                            h2h_home_score = int(score_spans[0].text.strip())
+                            h2h_away_score = int(score_spans[1].text.strip())
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not parse scores: {score_spans[0].text.strip()} - {score_spans[1].text.strip()}")
+                            continue
+                        
+                        logger.info(f"H2H match: {h2h_home_team} {h2h_home_score}-{h2h_away_score} {h2h_away_team}")
+                        
+                        # Check if the home team in this H2H match is our current home team
+                        home_is_current_home = team_names_match(h2h_home_team, current_home_team)
+                        away_is_current_away = team_names_match(h2h_away_team, current_away_team)
+                        
+                        # Alternative check: away team in H2H is current home team
+                        home_is_current_away = team_names_match(h2h_home_team, current_away_team)
+                        away_is_current_home = team_names_match(h2h_away_team, current_home_team)
+                        
+                        if (home_is_current_home and away_is_current_away) or (home_is_current_away and away_is_current_home):
+                            # This is a valid H2H match between our two teams
+                            if h2h_home_score > h2h_away_score:
+                                # Home team won this H2H match
+                                if home_is_current_home:
+                                    h2h_home_wins += 1
+                                    logger.info(f"Home team ({current_home_team}) won as home team in H2H")
+                                else:
+                                    h2h_away_wins += 1
+                                    logger.info(f"Away team ({current_away_team}) won as home team in H2H")
+                            elif h2h_away_score > h2h_home_score:
+                                # Away team won this H2H match
+                                if away_is_current_home:
+                                    h2h_home_wins += 1
+                                    logger.info(f"Home team ({current_home_team}) won as away team in H2H")
+                                else:
+                                    h2h_away_wins += 1
+                                    logger.info(f"Away team ({current_away_team}) won as away team in H2H")
+                            else:
+                                # It was a draw
+                                h2h_draws += 1
+                                logger.info("H2H match was a draw")
+                    except Exception as e:
+                        logger.warning(f"Error processing H2H row: {e}")
+                
+                logger.info(f"Overall H2H stats - Home wins: {h2h_home_wins}, Away wins: {h2h_away_wins}, Draws: {h2h_draws}")
+            else:
+                logger.warning("Head-to-head matches section not found")
+            
+            # Add H2H stats to match_data
+            match_data['Home_Recent_Wins'] = home_recent_wins
+            match_data['Home_Recent_Draws'] = home_recent_draws
+            match_data['Home_Recent_Losses'] = home_recent_losses
+            match_data['Home_Recent_Goals_Scored'] = home_recent_goals_scored
+            match_data['Home_Recent_Goals_Conceded'] = home_recent_goals_conceded
+            
+            match_data['Away_Recent_Wins'] = away_recent_wins
+            match_data['Away_Recent_Draws'] = away_recent_draws
+            match_data['Away_Recent_Losses'] = away_recent_losses
+            match_data['Away_Recent_Goals_Scored'] = away_recent_goals_scored
+            match_data['Away_Recent_Goals_Conceded'] = away_recent_goals_conceded
+            
+            match_data['H2H_Home_Wins'] = h2h_home_wins
+            match_data['H2H_Away_Wins'] = h2h_away_wins
+            match_data['H2H_Draws'] = h2h_draws
+        else:
+            logger.warning("Could not find H2H tab")
+    except Exception as e:
+        logger.error(f"Error extracting H2H data: {e}")
+        driver.save_screenshot("h2h_error_screenshot.png")
+
+    return match_data
+
+# Process a given season: click the season link, load all matches, extract data for each match
+def process_season(driver, season_name, archive_url):
+    logger.info(f"Processing season: {season_name}")
+    
+    try:
+        season_link = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.LINK_TEXT, season_name))
+        )
+        driver.execute_script("arguments[0].scrollIntoView(true);", season_link)
+        driver.execute_script("arguments[0].click();", season_link)
+        time.sleep(3)
+        logger.info(f"Clicked on {season_name}")
+    except Exception as e:
+        logger.error(f"Failed to click season {season_name}: {e}")
+        return
+    
+    # Load all matches by clicking "Show more matches"
+    click_count = 0
+    max_clicks = 50
+    while click_count < max_clicks:
+        try:
+            more_link = driver.find_element(By.CSS_SELECTOR, "a.event__more.event__more--static")
+            driver.execute_script("arguments[0].scrollIntoView(true);", more_link)
+            time.sleep(1)
+            driver.execute_script("arguments[0].click();", more_link)
+            click_count += 1
+            logger.info(f"Clicked 'Show more matches' ({click_count})")
+            time.sleep(2)
+        except Exception:
+            logger.info("No more 'Show more matches' link found")
+            break
+    logger.info(f"Total 'Show more matches' clicks: {click_count}")
+    
+    try:
+        match_elements = driver.find_elements(By.CSS_SELECTOR, 'a.eventRowLink[title="Click for match detail!"]')
+        match_urls = [elem.get_attribute("href") for elem in match_elements]
+        logger.info(f"Found {len(match_urls)} matches in {season_name}")
+    except Exception as e:
+        logger.error(f"Error collecting match links for {season_name}: {e}")
+        return
+    
+    # Process each match
+    for idx, match_url in enumerate(match_urls, start=1):
+        try:
+            logger.info(f"Processing match {idx}/{len(match_urls)}: {match_url}")
+            driver.get(match_url)
+            time.sleep(5)
+            match_data = extract_match_data(driver)
+            save_to_csv(match_data)
+            logger.info("Extracted Match Data:")
+            for key, value in match_data.items():
+                logger.info(f"{key}: {value}")
+        except Exception as e:
+            logger.error(f"Error processing match {match_url}: {e}")
+    
+    # Return to archive page for the next season
+    driver.get(archive_url)
+    time.sleep(3)
+    try:
+        archive_button = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.LINK_TEXT, 'ARCHIVE'))
+        )
+        driver.execute_script("arguments[0].scrollIntoView(true);", archive_button)
+        driver.execute_script("arguments[0].click();", archive_button)
+        time.sleep(3)
+        logger.info("Returned to ARCHIVE page")
+    except Exception as e:
+        logger.warning(f"Error returning to ARCHIVE page: {e}")
+
+# Main script execution
+try:
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    
+    base_url = "https://www.flashscore.com/football/germany/bundesliga/#/8l1ZdrsC/table/overall"
+    driver.get(base_url)
+    logger.info(f"Navigated to {base_url}")
+    time.sleep(5)
+    
+    try:
+        cookie_accept = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
+        )
+        cookie_accept.click()
+        time.sleep(2)
+        logger.info("Accepted cookies")
+    except Exception as e:
+        logger.info(f"Cookie dialog not present or already handled: {e}")
+    
+    try:
+        archive_button = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.LINK_TEXT, 'ARCHIVE'))
+        )
+        driver.execute_script("arguments[0].scrollIntoView(true);", archive_button)
+        driver.execute_script("arguments[0].click();", archive_button)
+        time.sleep(3)
+        logger.info("Clicked on ARCHIVE")
+    except Exception as e:
+        logger.error(f"Failed to click ARCHIVE: {e}")
+    
+    seasons = [
+        'Bundesliga 2014/2015', 'Bundesliga 2015/2016', 'Bundesliga 2016/2017',
+        'Bundesliga 2017/2018', 'Bundesliga 2018/2019', 'Bundesliga 2019/2020',
+        'Bundesliga 2020/2021', 'Bundesliga 2021/2022', 'Bundesliga 2022/2023',
+        'Bundesliga 2023/2024', 'Bundesliga 2024/2025'
+    ]
+    
+    archive_url = driver.current_url
+    
+    for season in seasons:
+        process_season(driver, season, archive_url)
+    
+except Exception as e:
+    logger.error(f"Critical error: {e}")
+finally:
+    # Uncomment the following line to close the browser when finished
+    # driver.quit()
+    logger.info("Script completed")
